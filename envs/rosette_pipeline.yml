@@ -1,0 +1,25 @@
+name: rosette_pipeline
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-data.table
+  - r-optparse
+  - r-jsonlite
+  - r-stringr
+  - r-dplyr
+  - r-tidyr
+  - r-readr
+  - r-ggplot2
+  - r-viridis
+
+  # Image handling through EBImage/Bioc
+  - bioconductor-ebimage
+  - r-png
+  - r-jpeg
+  - r-tiff
+  - fftw
+
+  # Helpful runtime/build basics
+  - pkg-config
+  - make
