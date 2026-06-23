@@ -1,2 +1,837 @@
 # RosetteR
 Counts Crithidia (and other species) rosette and cells-per-rosettes
+
+
+---
+title: "rosette_runner"
+author: "Noah Brown"
+date: "2026-06-20"
+output: html_document
+---
+
+```{bash}
+mkdir -p scripts raw_images results
+
+install.packages("BiocManager")
+BiocManager::install("EBImage")
+```
+
+Image preprocessing and generation of rosette outline masks
+
+Phase-contrast microscopy images were processed using a custom R-based image analysis workflow. Images were first imported as grayscale intensity matrices and normalized to a common pixel-intensity range. Because Crithidia cells and rosette borders appeared as high-contrast phase-dark structures, images were optionally contrast-inverted so that biological material was represented as foreground signal. To reduce local noise and improve object continuity, images were smoothed with a Gaussian filter prior to thresholding. Binary foreground masks were then generated using either adaptive local thresholding or global Otsu thresholding, with adaptive thresholding used for images with uneven illumination or locally variable background.
+
+Following thresholding, binary masks were refined using morphological operations. Small foreground speckles were removed by morphological opening, while small gaps in cell or rosette boundaries were closed by morphological closing. Enclosed holes within foreground regions were filled to generate solid masks representing the spatial footprint of individual cells, rosettes, or composite cell clusters. Connected foreground regions were then labeled as discrete objects, and objects below a minimum area threshold were removed as likely debris or segmentation noise. For each retained object, pixel-based measurements were extracted, including area, perimeter, centroid position, major-axis features, eccentricity, orientation, and bounding-box coordinates. A one-pixel-wide outline was generated from each binary mask by subtracting an eroded version of the mask from the original foreground region. This produced a contour layer representing the outer border of each detected cell or cell cluster. For quality control, the detected outline was overlaid on the original grayscale image, allowing direct visual assessment of segmentation accuracy.
+
+
+```{r}
+## `01_outline_layer.R` parameter notes
+
+This script takes either a single microscopy image or a directory of images and generates a first-pass outline layer. For each image, it creates a grayscale normalized image, processed thresholding image, binary foreground mask, 1-pixel outline mask, red-outline QC overlay, per-image object table, and combined summary tables. All measurements are reported in raw pixel units.
+
+### Required input/output parameters
+
+- `--input`
+  - Input image file or directory.
+  - If a directory is provided, the script searches for image files matching `--pattern`.
+  - Example: `--input raw_images`
+  - Example: `--input raw_images/test_image.tif`
+
+- `--out`
+  - Output directory for results.
+  - The script creates one subdirectory per image, plus combined tables.
+  - Example: `--out results/outline_v01`
+
+### Image discovery parameters
+
+- `--pattern`
+  - Regular expression used to identify image files when `--input` is a directory.
+  - Default: `\\.(png|jpg|jpeg|tif|tiff)$`
+  - Usually does not need to be changed unless using unusual image extensions.
+
+- `--recursive`
+  - Whether to search recursively inside subdirectories of the input directory.
+  - Options: `TRUE` or `FALSE`
+  - Default: `FALSE`
+
+### Foreground / contrast parameters
+
+- `--foreground`
+  - Defines whether biological material is darker or brighter than the background.
+  - Options:
+    - `dark`: cells/outlines are darker than background.
+    - `bright`: cells/outlines are brighter than background.
+    - `auto`: script tests both and chooses the one with foreground fraction closest to `--target_fraction`.
+  - Default: `dark`
+  - For phase-contrast images with dark parasite outlines, `dark` is usually appropriate.
+
+- `--target_fraction`
+  - Used only when `--foreground auto`.
+  - The script chooses the segmentation direction whose foreground mask covers a fraction of the image closest to this value.
+  - Default: `0.15`
+  - Example: `0.15` means the script expects roughly 15% of the image to be foreground.
+
+### Thresholding parameters
+
+- `--method`
+  - Thresholding method used to convert the processed grayscale image into a binary mask.
+  - Options:
+    - `adaptive`: local adaptive thresholding; better for uneven illumination.
+    - `otsu`: global Otsu thresholding; better for simple, evenly illuminated images.
+  - Default: `adaptive`
+
+- `--window`
+  - Local window size for adaptive thresholding.
+  - Used only when `--method adaptive`.
+  - Larger values smooth over broader background variation.
+  - Smaller values respond more strongly to local contrast.
+  - Default: `41`
+
+- `--offset`
+  - Threshold offset for adaptive thresholding.
+  - One of the most important tuning parameters.
+  - Lower values usually make the mask more permissive and may recover weak/faint cell edges.
+  - Higher values usually make the mask more stringent and may reduce background noise.
+  - Default: `0.03`
+
+### Preprocessing parameters
+
+- `--bg_sigma`
+  - Optional Gaussian background subtraction scale.
+  - `0` disables background subtraction.
+  - Larger values remove broad illumination gradients.
+  - Default: `0`
+  - Useful values to test if images have uneven illumination: `20`, `50`, `100`
+
+- `--smooth_sigma`
+  - Gaussian smoothing applied before thresholding.
+  - Helps reduce speckle/noise before binary mask generation.
+  - Default: `1`
+  - Larger values smooth more aggressively but can blur fine edges.
+
+### Morphology / mask cleanup parameters
+
+- `--open_radius`
+  - Radius of morphological opening.
+  - Removes small foreground specks/noise.
+  - Default: `1`
+  - Increasing this makes cleanup more aggressive but may remove small real cells or thin structures.
+
+- `--close_radius`
+  - Radius of morphological closing.
+  - Closes small gaps in cell/clump outlines.
+  - Default: `3`
+  - Increasing this can help produce continuous rosette/clump masks, but may also merge nearby objects.
+
+- `--fill_holes`
+  - Whether to fill enclosed holes inside foreground objects.
+  - Options: `TRUE` or `FALSE`
+  - Default: `TRUE`
+  - Usually useful for generating a solid outline layer around rosettes/clumps.
+
+### Object filtering / first-pass classification parameters
+
+- `--min_area`
+  - Minimum connected-object area in pixels.
+  - Objects smaller than this are removed as likely noise.
+  - Default: `50`
+  - Increase this if tiny debris/noise is being counted as objects.
+
+- `--single_area_max`
+  - Optional area threshold for crude first-pass classification of connected objects.
+  - If set to `NA`, all objects are labeled `unclassified_connected_object`.
+  - If set to a number, objects with area less than or equal to this value are labeled `candidate_single_swimmer`; larger objects are labeled `candidate_rosette_or_cluster`.
+  - Default: `NA`
+  - Example: `--single_area_max 400`
+
+### Most useful tuning parameters
+
+The most commonly adjusted parameters are:
+
+- `--foreground`
+- `--offset`
+- `--window`
+- `--smooth_sigma`
+- `--close_radius`
+- `--min_area`
+- `--single_area_max`
+
+General tuning logic:
+
+- If cell outlines are missing:
+  - decrease `--offset`
+  - increase `--close_radius`
+  - try a larger `--window`
+
+- If background/noise is being detected:
+  - increase `--offset`
+  - increase `--min_area`
+  - increase `--open_radius`
+  - try `--bg_sigma` if illumination is uneven
+
+- If neighboring rosettes are being merged too aggressively:
+  - decrease `--close_radius`
+  - decrease `--smooth_sigma`
+  - consider setting `--fill_holes FALSE` for testing
+
+- If outlines are fragmented:
+  - increase `--close_radius`
+  - increase `--smooth_sigma`
+  - decrease `--offset`
+
+### Key output files
+
+For each image:
+
+- `gray.png`
+  - Normalized grayscale input image.
+
+- `processed.png`
+  - Processed image after contrast inversion, smoothing, and optional background correction.
+
+- `mask.binary.png`
+  - Binary foreground mask.
+
+- `outline.png`
+  - 1-pixel outline derived from the binary mask.
+
+- `outline_overlay.png`
+  - QC image showing the detected outline in red over the grayscale input.
+
+- `objects.tsv`
+  - Per-object measurements in pixels.
+
+Combined outputs:
+
+- `all_objects.tsv`
+  - Combined object table across all images.
+
+- `image_summary.tsv`
+  - Per-image summary table.
+```
+
+
+```{bash}
+
+Rscript scripts/01_outline_layer.R \
+  --input raw_images \
+  --out results/outline_v01 \
+  --pattern "\\.(png|jpg|jpeg|tif|tiff)$" \
+  --recursive FALSE \
+  --foreground bright \
+  --target_fraction 0.30 \
+  --method adaptive \
+  --window 41 \
+  --offset 0.03 \
+  --bg_sigma 90 \
+  --smooth_sigma 1.2 \
+  --open_radius 2 \
+  --close_radius 5 \
+  --fill_holes TRUE \
+  --min_area 100 \
+  --single_area_max 1000
+  
+```
+
+Candidate rosette center detection from boundary geometry
+
+Candidate rosette centers were inferred from the geometry of the binary object masks generated during the preprocessing step. Each connected foreground object above a minimum area threshold was considered a potential rosette-containing cluster. For each object, the outer boundary contour was extracted from the binary mask and represented as a set of pixel coordinates. Boundary points were subsampled where necessary to limit computational cost while preserving the overall object geometry.
+
+Rosette centers were identified by searching for locally circular arcs along the object boundary. Boundary pixels were used as seed locations, and for each seed, nearby contour points within a defined neighborhood radius were collected. A circle was then fit to each local boundary neighborhood using least-squares circle fitting. Candidate arcs were retained only if they met minimum criteria for number of supporting boundary points, fitted radius, angular span, and normalized fit error. These filters were intended to enrich for boundary regions consistent with partial rosette curvature while excluding small irregularities or poorly supported edge features.
+
+For each retained fitted arc, the corresponding circle center was treated as a candidate rosette center. Several geometric features were calculated to score the biological plausibility of each candidate. These included the normalized circle-fit error, the angular span of the supporting arc, whether the inferred center fell within the parent foreground object, and the degree of radial support around the candidate center. Radial support was assessed by projecting rays from the candidate center across a fixed number of angles and measuring the distribution of distances from the center to the object boundary. Opposing radial distances were compared to estimate radial balance. Candidates with relatively even opposing distances were interpreted as more consistent with a radially organized rosette, whereas candidates with strong directional imbalance were flagged as potential sites of rosette overlap, interrupted radiality, or composite clustering.
+
+Candidate centers were assigned a composite confidence score based on arc fit quality, arc span, radial coverage, center position, and radial balance. Because overlapping rosettes may produce biologically meaningful radial imbalance, imbalance was not treated solely as a rejection criterion. Instead, highly imbalanced accepted candidates were flagged separately as possible overlap-associated structures. Nearby candidate centers were merged within a defined distance threshold to reduce redundant calls arising from multiple overlapping arc fits along the same rosette boundary. For each merged candidate, the highest-scoring supporting fit was retained as the representative center, and the number of supporting raw fits was recorded. Candidate centers passing confidence and support thresholds were retained for downstream rosette territory assignment. Quality-control images were generated showing the original object outlines, rejected candidate centers, accepted candidate centers, fitted rosette circles, and centers flagged for potential overlap.
+
+
+```{r}
+## `02_candidate_rosette_centers.R` parameter notes
+
+This script takes the binary mask and grayscale image outputs from `01_outline_layer.R` and identifies candidate rosette centers from the geometry of detected object boundaries. It does not count cells or assign cell territories. Instead, it searches for locally circular arcs along each detected object boundary, fits candidate circles to those arcs, scores the inferred centers, merges redundant nearby candidates, and generates quality-control overlays.
+
+### Required input/output parameters
+
+* `--input`
+
+  * Input directory containing Step 1 output.
+  * This can be either the full Step 1 result directory, such as `results/outline_v01`, or a single image-specific Step 1 result folder.
+  * The script searches for files matching `--mask_name`.
+  * Default: `results/outline_v01`
+
+* `--out`
+
+  * Output directory for candidate center results.
+  * The script creates one subdirectory per image, plus combined tables.
+  * Default: `results/centers_v01`
+
+### Step 1 file names
+
+* `--mask_name`
+
+  * Name of the binary mask file produced by Step 1.
+  * Default: `mask.binary.png`
+  * Usually should not be changed unless Step 1 output file names were modified.
+
+* `--gray_name`
+
+  * Name of the grayscale image file produced by Step 1.
+  * Used for QC overlays.
+  * Default: `gray.png`
+  * If missing, the binary mask is used as the background image for overlays.
+
+### Object filtering
+
+* `--min_blob_area`
+
+  * Minimum area, in pixels, for a connected object to be considered for rosette-center detection.
+  * Smaller objects are ignored because they are more likely to be single cells, debris, or insufficiently large to support rosette geometry.
+  * Default: `500`
+  * Increase this if many small non-rosette objects are being tested.
+  * Decrease this if small rosettes are being missed.
+
+### Boundary subsampling / computational limits
+
+* `--max_boundary_points`
+
+  * Maximum number of boundary pixels retained per object for circle fitting and radial analysis.
+  * Large objects can have thousands of boundary pixels; this parameter limits computational cost.
+  * Default: `2500`
+  * Increasing this may improve geometric precision for large or complex objects but will slow the script.
+
+* `--max_seed_points`
+
+  * Maximum number of boundary seed points tested per object.
+  * Each seed point defines a local boundary neighborhood for possible arc fitting.
+  * Default: `600`
+  * Increasing this makes the search more exhaustive but slower.
+  * Decreasing this speeds the script but may miss candidate arcs.
+
+### Local arc fitting parameters
+
+* `--neighborhood_radius`
+
+  * Radius, in pixels, around each boundary seed point used to collect local contour points for circle fitting.
+  * Default: `60`
+  * Larger values fit broader arcs and may better capture large rosettes.
+  * Smaller values focus on local curvature and may better separate complex or overlapping structures.
+
+* `--min_arc_points`
+
+  * Minimum number of boundary points required within a local neighborhood for a circle fit to be attempted.
+  * Default: `25`
+  * Increase this to require stronger contour support.
+  * Decrease this to allow smaller or more partial arcs.
+
+* `--min_radius`
+
+  * Minimum allowed fitted circle radius, in pixels.
+  * Default: `15`
+  * Candidate circles smaller than this are discarded as unlikely rosettes or boundary noise.
+
+* `--max_radius`
+
+  * Maximum allowed fitted circle radius, in pixels.
+  * Default: `300`
+  * Candidate circles larger than this are discarded.
+  * Tune this based on the largest expected rosette radius in the image set.
+
+* `--min_arc_angle`
+
+  * Minimum angular span, in degrees, required for a fitted arc to be retained.
+  * Default: `35`
+  * Higher values require more complete circular support.
+  * Lower values allow more partial arcs, which may help with overlapping rosettes but can increase false positives.
+
+* `--max_fit_error`
+
+  * Maximum allowed normalized circle-fit error.
+  * The fit error is normalized by the fitted radius.
+  * Default: `0.12`
+  * Lower values make the algorithm stricter and retain only cleaner circular arcs.
+  * Higher values allow more irregular arcs but may increase false positives.
+
+### Radiality and imbalance scoring
+
+* `--ray_angles`
+
+  * Number of radial directions projected from each candidate center.
+  * Must be an even number because opposing rays are compared.
+  * Default: `32`
+  * Higher values give finer angular sampling but can be noisier and slower.
+  * Lower values are faster but less detailed.
+
+* `--radial_bin_width_deg`
+
+  * Angular width, in degrees, used to find boundary points near each projected radial direction.
+  * Default: `12`
+  * Larger values make radial measurements more tolerant of rough boundaries.
+  * Smaller values make radial measurements more precise but may leave more angles without boundary support.
+
+* `--overlap_imbalance_threshold`
+
+  * Threshold for flagging a candidate as having strong radial imbalance.
+  * Default: `0.45`
+  * This does not automatically reject the candidate.
+  * Instead, accepted candidates above this threshold are flagged as possible overlap-associated or interrupted-radiality structures.
+
+### Candidate merging and acceptance
+
+* `--center_merge_dist`
+
+  * Maximum distance, in pixels, for nearby raw candidate centers to be merged into one representative candidate.
+  * Default: `20`
+  * Decrease this if nearby overlapping rosettes are being merged into one candidate.
+  * Increase this if one biological rosette is being split into many nearby duplicate candidates.
+
+* `--min_total_score`
+
+  * Minimum composite confidence score required for a merged candidate to be accepted.
+  * Default: `0.45`
+  * Increase this to reduce false positives.
+  * Decrease this to recover weaker or more partial rosette candidates.
+
+* `--min_merged_support`
+
+  * Minimum number of raw candidate fits supporting a merged center.
+  * Default: `2`
+  * Increase this to require stronger repeated support.
+  * Decrease this to allow single-fit candidates, which may help detect partial or small rosettes.
+
+### QC overlay parameters
+
+* `--draw_rejected_top_n`
+
+  * Maximum number of rejected or lower-confidence candidate centers drawn on the full QC overlay.
+  * Default: `100`
+  * This prevents very noisy images from producing unreadable overlays.
+  * Does not affect the candidate tables.
+
+### Key output files
+
+For each image:
+
+* `candidate_centers.raw.tsv`
+
+  * All raw arc-derived candidate centers before merging.
+  * Useful for debugging whether arcs are being detected at all.
+
+* `candidate_centers.tsv`
+
+  * Merged candidate centers with confidence scores, acceptance status, radial metrics, and possible-overlap flags.
+
+* `candidate_centers_overlay.png`
+
+  * QC overlay showing object outlines, accepted centers, accepted fitted circles, possible overlap flags, and top rejected candidates.
+
+* `accepted_centers_overlay.png`
+
+  * Cleaner QC overlay showing only accepted candidate centers and fitted circles.
+
+* `center_summary.tsv`
+
+  * Per-image summary of number of blobs, raw candidates, merged candidates, accepted candidates, and possible overlap flags.
+
+Combined outputs:
+
+* `all_candidate_centers.raw.tsv`
+
+  * Combined raw candidate table across all images.
+
+* `all_candidate_centers.tsv`
+
+  * Combined merged candidate table across all images.
+
+* `center_image_summary.tsv`
+
+  * Per-image summary table across all processed images.
+
+### How to interpret QC overlays
+
+* Red outline:
+
+  * Object boundary from Step 1.
+
+* Cyan cross:
+
+  * Rejected or lower-confidence candidate center.
+
+* Green circle:
+
+  * Accepted fitted rosette circle.
+
+* Green cross:
+
+  * Accepted candidate rosette center.
+
+* Magenta cross:
+
+  * Accepted center with strong radial imbalance.
+  * This may indicate overlapping rosettes, interrupted radiality, or composite rosette structure.
+
+### Most useful tuning parameters
+
+The most commonly adjusted parameters are:
+
+* `--min_blob_area`
+* `--neighborhood_radius`
+* `--min_arc_angle`
+* `--max_fit_error`
+* `--min_total_score`
+* `--min_merged_support`
+* `--center_merge_dist`
+* `--overlap_imbalance_threshold`
+
+General tuning logic:
+
+* If too many false-positive centers are detected:
+
+  * increase `--min_total_score`
+  * increase `--min_merged_support`
+  * decrease `--max_fit_error`
+  * increase `--min_arc_angle`
+  * increase `--min_blob_area`
+
+* If real rosettes are being missed:
+
+  * decrease `--min_total_score`
+  * decrease `--min_merged_support`
+  * increase `--max_fit_error`
+  * decrease `--min_arc_angle`
+  * decrease `--min_blob_area`
+
+* If one rosette is being split into multiple nearby centers:
+
+  * increase `--center_merge_dist`
+
+* If overlapping rosettes are being merged into a single center:
+
+  * decrease `--center_merge_dist`
+  * decrease `--neighborhood_radius`
+
+* If fitted circles are too small:
+
+  * increase `--min_radius`
+
+* If fitted circles are too large:
+
+  * decrease `--max_radius`
+
+* If overlap/interruption flags are too frequent:
+
+  * increase `--overlap_imbalance_threshold`
+
+* If likely overlaps are not being flagged:
+
+  * decrease `--overlap_imbalance_threshold`
+
+```
+
+
+```{bash}
+Rscript scripts/02_candidate_rosette_centers.R \
+  --input results/outline_v01 \
+  --out results/centers_v01 \
+  --mask_name mask.binary.png \
+  --gray_name gray.png \
+  --min_blob_area 675 \
+  --max_boundary_points 1000 \
+  --max_seed_points 500 \
+  --neighborhood_radius 20 \
+  --min_arc_points 20 \
+  --min_radius 15 \
+  --max_radius 400 \
+  --min_arc_angle 45 \
+  --max_fit_error 0.12 \
+  --ray_angles 26 \     
+  --radial_bin_width_deg 110 \
+  --center_merge_dist 45 \
+  --min_total_score 0.60 \
+  --require_center_inside TRUE \
+  --center_inside_erode_radius 0 \
+  --merge_method weighted \
+  --merge_weight_power 2 \
+  --merge_min_score_fraction 0.50 \
+  --min_merged_support 2 \
+  --overlap_imbalance_threshold 0.50 \
+  --draw_rejected_top_n 0
+```
+
+
+Cells within each detected cluster were segmented using a geometry-guided, membrane-aware subdivision approach. For each image, the grayscale membrane image and corresponding binary cluster mask were loaded, and candidate rosette centers and radii from the preceding rosette-detection step were used as spatial assignment anchors. Within each cluster mask, dark membrane-like ridges were enhanced by comparing local grayscale intensity to a smoothed local background, thresholded to identify putative cell-cell boundaries, and optionally used as internal cut lines before segmentation. The resulting cluster geometry was then converted into a distance-transform image, where high values corresponded to the interiors of cell-like compartments, and seeded watershed subdivision was applied to separate adjacent cells within each cluster. Segmented objects were filtered using geometric criteria, including area, distance-transform radius, solidity, circularity, and contact with the outer cluster boundary, to distinguish complete or near-complete cells from small fragments, slivers, and edge artifacts. Accepted cell objects were assigned uniquely to rosettes based on centroid proximity to candidate rosette centers, normalized by rosette radius, with optional weighting for overlap with the rosette disk. For quality control, the pipeline generated diagnostic overlays showing cluster outlines, membrane candidates, watershed-derived cell boundaries, accepted and rejected cell objects, rosette centers/radii, and final cell-to-rosette assignments. Final outputs included per-cell geometry and assignment tables, as well as per-rosette cell-count summaries.
+
+```{r}
+--input
+    Input folder. Can be a single image folder or a parent folder containing image result folders.
+    The folder should contain, or lead to folders containing, gray.png and the cluster mask.
+
+--out
+    Output directory for the geometry/membrane-based Step 3b results.
+
+--image_id_override
+    Optional manual image ID. Useful if the folder is named something generic like outline_v01 but the real image ID is Snap_246.
+
+--gray_name
+    Filename of the grayscale/membrane image inside each image folder.
+    Default: gray.png
+
+--gray_path
+    Explicit path to one gray image. Best for single-image debugging.
+
+--gray_dir
+    Optional external root directory containing gray images.
+    In batch mode, the script tries gray_dir/image_id/gray_name.
+
+--cluster_mask_name
+    Filename of the Step 1 binary cluster/object mask.
+    Example: mask.binary.png
+
+--cluster_mask_path
+    Explicit path to one cluster mask. Best for single-image debugging.
+
+--cluster_mask_dir
+    Optional external root directory containing cluster masks.
+    In batch mode, the script tries cluster_mask_dir/image_id/cluster_mask_name.
+
+--rosette_table_name
+    Filename of the Step 2 candidate-center / rosette table.
+    Example: all_candidate_centers.tsv
+
+--rosette_table_path
+    Explicit path to one candidate-center table. Best for single-image debugging.
+
+--rosette_table_dir
+    Optional external root directory containing candidate-center tables.
+    In batch mode, the script tries rosette_table_dir/image_id/rosette_table_name.
+
+--candidate_center_source
+    Which center/radius columns to use from all_candidate_centers.tsv.
+    Options:
+        weighted = weighted_center_x, weighted_center_y, weighted_fitted_radius_px
+        best     = best_center_x, best_center_y, best_fitted_radius_px
+        raw      = center_x, center_y, fitted_radius_px
+        auto     = tries weighted, then best, then raw
+    Recommended default: weighted
+
+--accepted_only
+    TRUE/FALSE. If the candidate-center table has an accepted column, only use accepted rows.
+    Recommended default: TRUE
+
+--require_center_inside_blob
+    TRUE/FALSE. If TRUE, require the selected center to fall inside the parent blob when the relevant column exists.
+    For weighted centers, uses weighted_center_inside_blob when available.
+    Recommended initial default: FALSE
+
+--min_candidate_confidence
+    Optional minimum confidence threshold for candidate-center rows.
+    Use NA to disable.
+    Example: --min_candidate_confidence 0.5
+
+--mask_foreground
+    Foreground polarity for the binary mask.
+    Options:
+        auto
+        bright
+        dark
+    Recommended default: auto
+
+--fill_cluster_holes
+    TRUE/FALSE. Fill holes in the cluster mask before subdividing into cells.
+    Recommended default: TRUE
+
+--min_cluster_area_px
+    Minimum connected-component cluster area to process.
+    Small objects below this size are ignored.
+
+--use_membrane_cuts
+    TRUE/FALSE. Use dark membrane lines from gray.png as internal cut lines before watershed subdivision.
+    Recommended default: TRUE
+
+--membrane_bg_radius_px
+    Radius used for local background estimation when enhancing dark membrane ridges.
+    Larger values detect broader dark structures; smaller values detect finer local contrast.
+    Good starting value: 9
+
+--membrane_quantile
+    Quantile threshold for dark membrane ridge scores inside each cluster.
+    Higher values produce fewer membrane cuts.
+    Lower values produce more membrane cuts.
+    Good starting value: 0.82
+
+--membrane_min_score
+    Minimum dark-ridge score required for a pixel to be considered membrane.
+    Increase if too many weak/noisy membrane lines are detected.
+    Decrease if real membranes are missed.
+    Good starting value: 0.025
+
+--membrane_open_px
+    Morphological opening radius for cleaning the membrane mask.
+    Use 0 to disable.
+    Increase slightly if membrane detection is noisy.
+    Good starting value: 0
+
+--membrane_dilate_px
+    Dilation radius for membrane cut lines.
+    Larger values make membrane cuts thicker and split cells more aggressively.
+    Good starting value: 1
+
+--min_cell_area_px
+    Minimum segmented object area allowed to count as a cell.
+    Increase if tiny fragments are being counted.
+
+--max_cell_area_px
+    Maximum segmented object area allowed to count as a cell.
+    Decrease if merged multi-cell chunks are being counted as one cell.
+
+--min_cell_radius_px
+    Minimum distance-transform radius required for a segmented object.
+    Increase if thin slivers are being counted as cells.
+
+--max_cell_radius_px
+    Maximum distance-transform radius allowed for a segmented object.
+    Decrease if huge merged blobs are being accepted.
+
+--seed_smooth_sigma
+    Gaussian smoothing applied to the distance map before watershed.
+    Higher values reduce over-splitting.
+    Lower values preserve fine separations.
+    Good starting value: 1.0
+
+--seed_min_distance_px
+    Controls minimum spacing/extent of watershed seeds.
+    Larger values reduce over-splitting.
+    Smaller values allow more individual cell seeds.
+    Good starting value: 5
+
+--watershed_tolerance
+    Watershed merging tolerance.
+    Larger values merge weak local maxima and reduce over-splitting.
+    Smaller values split more aggressively.
+    Good starting value: 1.0
+
+--min_solidity
+    Minimum solidity for accepted cells.
+    Lower values allow irregular cells.
+    Higher values reject concave or fragmented objects.
+    Good starting value: 0.35
+
+--min_circularity
+    Minimum circularity/compactness for accepted cells.
+    Lower values allow elongated or irregular cells.
+    Higher values require more round cell-like objects.
+    Good starting value: 0.10
+
+--max_edge_contact_fraction
+    Maximum fraction of a cell boundary allowed to contact the outer cluster boundary.
+    Lower values reject edge-truncated partial cells more aggressively.
+    Higher values allow more peripheral cells.
+    Good starting value: 0.75
+
+--assignment_max_norm_distance
+    Maximum allowed distance from cell centroid to rosette center, normalized by rosette radius.
+    Larger values assign farther cells.
+    Smaller values restrict assignments to cells near the rosette center.
+    Good starting value: 1.60
+
+--assignment_radius_weight
+    Weight given to normalized distance from rosette center during assignment.
+    Higher values prioritize nearest-center assignment more strongly.
+    Good starting value: 1.0
+
+--assignment_overlap_weight
+    Weight given to overlap between the cell and the rosette disk.
+    Higher values favor cells whose area overlaps the rosette radius.
+    Good starting value: 0.5
+
+--assignment_min_overlap
+    Minimum overlap fraction that can rescue a cell assignment even if distance is high.
+    Use 0.0 to disable overlap rescue.
+    Good starting value: 0.0
+
+--draw_cell_ids
+    TRUE/FALSE. Draw cell IDs on the overlay.
+
+--draw_rejected
+    TRUE/FALSE. Draw rejected fragments on the overlay.
+    Recommended for debugging: TRUE
+
+--label_mode
+    Label style for overlays.
+    Options:
+        none
+        cell
+        rosette
+        both
+    Recommended debugging value: both
+
+--overlay_scale
+    Scale factor for output PNG overlays.
+    Larger values make labels easier to read.
+    Good starting value: 4
+
+--boundary_line_width_px
+    Width/dilation radius for drawn cell boundary lines in overlays.
+    Increase if boundaries are hard to see.
+
+--debug
+    TRUE/FALSE. Write detailed intermediate overlays and diagnostic images.
+    Recommended for tuning: TRUE
+
+--debug_parser
+    TRUE/FALSE. Print detailed candidate-center table parsing diagnostics.
+    Use TRUE only when debugging file/header/path problems.
+    For normal runs: FALSE
+
+--keep_going
+    TRUE/FALSE. In batch mode, continue after failed images.
+    For debugging: FALSE
+    For full batch runs: TRUE
+
+--max_folders
+    Optional limit on number of folders to process.
+    Useful for fast testing.
+    Example: --max_folders 1
+```
+
+
+```{bash}
+Rscript scripts/03b_segment_cells_by_cluster_geometry.R \
+  --input results/outline_v01 \
+  --out results/03b_geometry_cells_debug_fine01 \
+  --gray_name gray.png \
+  --cluster_mask_name mask.binary.png \
+  --rosette_table_name all_candidate_centers.tsv \
+  --candidate_center_source weighted \
+  --accepted_only TRUE \
+  --require_center_inside_blob FALSE \
+  --min_candidate_confidence 0.1 \
+  --mask_foreground bright \
+  --fill_cluster_holes FALSE \
+  --min_cluster_area_px 40 \
+  --use_membrane_cuts TRUE \
+  --membrane_bg_radius_px 7 \
+  --membrane_quantile 0.80 \
+  --membrane_min_score 0.020 \
+  --membrane_open_px 0 \
+  --membrane_dilate_px 0 \
+  --min_cell_area_px 35 \
+  --max_cell_area_px 1200 \
+  --min_cell_radius_px 1.5 \
+  --max_cell_radius_px 80 \
+  --seed_smooth_sigma 0.6 \
+  --seed_min_distance_px 3 \
+  --watershed_tolerance 0.6 \
+  --min_solidity 0.25 \
+  --min_circularity 0.08 \
+  --max_edge_contact_fraction 0.50 \
+  --assignment_max_norm_distance 1.30 \
+  --assignment_radius_weight 1.0 \
+  --assignment_overlap_weight 0.5 \
+  --assignment_min_overlap 0.25 \
+  --draw_cell_ids TRUE \
+  --draw_rejected TRUE \
+  --label_mode both \
+  --overlay_scale 5 \
+  --boundary_line_width_px 0 \
+  --debug TRUE \
+  --debug_parser FALSE \
+  --keep_going FALSE
+```
