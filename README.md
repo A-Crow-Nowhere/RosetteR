@@ -2,7 +2,7 @@
 Counts Crithidia (and other species) rosette and cells-per-rosettes
 
 
-##EASY RUNNER
+## EASY RUNNER
 
 chmod +x * scripts/*
 
