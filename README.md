@@ -2,17 +2,16 @@
 Counts Crithidia (and other species) rosette and cells-per-rosettes
 
 
-## EASY RUNNER
+## EASY RUNNER AND SUMMARIZER (in bash)
 
 chmod +x * scripts/*
-
-  bash scripts/04_summarize_rosette_cells.R \
+ bash scripts/run_rosette_pipeline.sh \
   --input Project \
   --out Project/04_summary \
   --project_level TRUE
 
 
-
+## A complete RMD description of each of the three major steps
 ---
 title: "rosette_runner"
 author: "Noah Brown"
