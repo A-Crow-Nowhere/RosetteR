@@ -2,13 +2,12 @@
 Counts Crithidia (and other species) rosette and cells-per-rosettes
 
 
-```EASY RUNNER
+EASY RUNNER
 /home/a-crow-nowhere/MalariAPI/envs/rosette_pipeline/lib/R/bin/Rscript \
   scripts/04_summarize_rosette_cells.R \
   --input Project \
   --out Project/04_summary \
   --project_level TRUE
-```
 
 
 
